@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Локальные файлы, не для репозитория
+.claude/
+CLAUDE.md
+old/otbor.py
+old/otbor_atributov.ipynb
