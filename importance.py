@@ -18,6 +18,9 @@ importance.py — оценка информативности признаков
     * Метод = функция важности за фолд + общий цикл _stable_cv.
       Функция отвечает на вопрос «что посчитать на фолде», цикл — «на
       каких фолдах и как усреднить» (аналогично фабрикам make_* в common).
+    * Тип задачи (task) задаётся в конструкторе; всё, что от него зависит
+      (функции filter-методов, выход модели для SHAP, дефолтные метрики,
+      проверки классов в фолдах), берётся из хелперов common.
 
 Пример использования:
     X, y, feature_names, groups, classes = load_data("data.csv", "Y")
@@ -29,6 +32,14 @@ importance.py — оценка информативности признаков
                   scoring=["roc_auc_ovr", "balanced_accuracy"])
     ev.compute_shap(lambda s: make_rf(s), "shap_rf")
     ev.get_ranking("pi_rf_roc_auc_ovr")
+
+    # регрессия: те же методы, фабрики make_*_reg
+    X, y, feature_names, _, _ = load_data("data.csv", "Y", task="regression")
+    ev = ImportanceEvaluator(X, y, feature_names, task="regression")
+    ev.compute_mi("mi").compute_pi(lambda s: make_rf_reg(s), "pi_rf")
+    ev.compute_l1_importance(lambda s: make_linreg(s, alpha=0.1, l1_ratio=1),
+                             "l1")
+    ev.get_ranking("pi_rf_r2")
 """
 
 from __future__ import annotations
@@ -40,15 +51,19 @@ import pandas as pd
 import shap
 from joblib import Parallel, delayed
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import ElasticNet, LogisticRegression, Ridge
 
 from common import (
     ConfigurationError,
     check_cv,
     check_data,
+    check_mi_neighbors,
+    check_task,
     cv_for_run,
+    get_default_scoring,
     get_filter_func,
     get_predict_fn,
+    get_predict_output,
     make_folds,
 )
 
@@ -72,38 +87,43 @@ class ImportanceEvaluator:
     ----------
     X : array-like, shape (n_samples, n_features)
     y : array-like, shape (n_samples,)
-        Коды классов 0..K-1 (см. load_data).
+        Классификация — коды классов 0..K-1, регрессия — float
+        (см. load_data).
     feature_names : list[str]
         Имена признаков, len == n_features.
     groups : array-like, shape (n_samples,) | None, default None
         Группы для групповых сплиттеров (GroupKFold, LeaveOneGroupOut).
     cv : sklearn CV splitter | None, default None
-        Проходит через check_cv(cv, random_state); None ->
-        StratifiedKFold(5, shuffle=True, random_state=random_state).
+        Проходит через check_cv(cv, random_state, task); None ->
+        StratifiedKFold(5, shuffle=True, random_state=random_state),
+        для регрессии — KFold.
     n_runs : int, default 5
         Число прогонов CV по умолчанию для всех методов.
     random_state : int, default 42
         Seed дефолтного сплиттера (при cv=None).
     n_jobs : int, default -1
         Число параллельных задач (run, fold); -1 — все ядра.
+    task : {'classification', 'regression'}, default 'classification'
+        Тип задачи.
 
     Исключения
     ----------
     DataValidationError
         Несогласованные размеры X, y, groups, feature_names.
     ConfigurationError
-        Некорректный cv.
+        Некорректный cv или task.
     """
 
     def __init__(self, X, y, feature_names, groups=None, cv=None, n_runs=5,
-                 random_state=42, n_jobs=-1):
+                 random_state=42, n_jobs=-1, task="classification"):
         X, y, feature_names, groups = check_data(X, y, feature_names, groups)
 
+        self.task = check_task(task)
         self.X = X
         self.y = y
         self.feature_names = feature_names
         self.groups = groups
-        self.cv = check_cv(cv, random_state)
+        self.cv = check_cv(cv, random_state, task)
         self.n_runs = n_runs
         self.random_state = random_state
         self.n_jobs = n_jobs
@@ -173,7 +193,8 @@ class ImportanceEvaluator:
         for run_index in range(n_runs):
             folds = make_folds(cv_for_run(self.cv, run_index), self.X, self.y,
                                self.groups,
-                               check_val_classes=check_val_classes)
+                               check_val_classes=check_val_classes,
+                               task=self.task)
             for fold_index, (train_indices, val_indices) in enumerate(folds):
                 tasks.append((run_index, train_indices, val_indices,
                               run_index * 1000 + fold_index))
@@ -242,22 +263,14 @@ class ImportanceEvaluator:
     # их обрабатывает.
 
     @staticmethod
-    def _mi_fold(X_train, y_train, seed, n_neighbors=3, **kwargs):
-        """Mutual information каждого признака с классом на train-части фолда.
+    def _mi_fold(X_train, y_train, seed, task, n_neighbors=3, **kwargs):
+        """Mutual information каждого признака с y на train-части фолда.
 
-        sklearn при n_neighbors >= размера класса молча уменьшает k для этого
-        класса, и оценки по классам становятся несопоставимыми — поэтому
-        ошибка, а не тихая подмена.
+        n_neighbors проверяется в check_mi_neighbors (для классификации —
+        меньше размера самого малого класса).
         """
-        counts = np.bincount(np.asarray(y_train))
-        n_min = int(counts[counts > 0].min())
-
-        if n_neighbors >= n_min:
-            raise ConfigurationError(
-                f"MI: n_neighbors={n_neighbors} должно быть меньше размера "
-                f"самого малого класса в train-фолде ({n_min})"
-            )
-        return get_filter_func("mi")(
+        check_mi_neighbors(y_train, n_neighbors, task)
+        return get_filter_func("mi", task)(
             X_train, y_train,
             discrete_features=False,
             n_neighbors=n_neighbors,
@@ -266,14 +279,15 @@ class ImportanceEvaluator:
         )
 
     @staticmethod
-    def _anova_f_fold(X_train, y_train, seed=None):
-        """F-статистика ANOVA каждого признака на train-части фолда.
+    def _anova_f_fold(X_train, y_train, task, seed=None):
+        """F-статистика каждого признака на train-части фолда.
 
-        p-value отбрасывается. Для признака, константного внутри всех классов,
-        F = NaN; на 0 его заменяет _stable_cv. seed не используется:
-        f_classif детерминирован.
+        Классификация — однофакторный ANOVA (f_classif), регрессия —
+        F-тест линейной связи с y (f_regression). p-value отбрасывается.
+        Для константного признака F = NaN; на 0 его заменяет _stable_cv.
+        seed не используется: обе функции детерминированы.
         """
-        F, _ = get_filter_func("anova_f")(X_train, y_train)
+        F, _ = get_filter_func("anova_f", task)(X_train, y_train)
         return F
 
     @staticmethod
@@ -292,9 +306,9 @@ class ImportanceEvaluator:
         """Модули коэффициентов, агрегированные по классам; val не нужен.
 
         coef_ у LogisticRegression имеет форму (K, p), при двух классах —
-        (1, p). 
-        atleast_2d нужен для регрессии: там coef_
-        одномерный (p,), и без него sum(axis=0) свернул бы признаки в число.
+        (1, p). У регрессии (ElasticNet) coef_ одномерный (p,):
+        atleast_2d делает из него (1, p), иначе sum(axis=0) свернул бы
+        признаки в число; агрегация по одной строке ничего не меняет.
         """
         estimator = ImportanceEvaluator._get_estimator(model)
         coef = np.abs(np.atleast_2d(estimator.coef_))
@@ -325,14 +339,14 @@ class ImportanceEvaluator:
 
     @staticmethod
     def _shap_fold(model, X_val, y_val, seed, X_train, explainer,
-                   model_output, n_background, max_evals):
+                   model_output, n_background, max_evals, task):
         """SHAP-важность на val-части фолда: sum_k mean_i |phi_ijk|.
 
         Интервенционный режим, фон — случайная подвыборка train-части
-        (seed). y_val не используется. 
+        (seed). y_val не используется.
         explainer уже выбран и проверен в compute_shap.
         Модуль берётся до суммы по классам: в пространстве вероятностей
-        вклады по классам в сумме дают 0.
+        вклады по классам в сумме дают 0. У регрессии выход один (k = 1).
         """
         rng = np.random.default_rng(seed)
         n_bg = min(n_background, len(X_train))
@@ -367,10 +381,10 @@ class ImportanceEvaluator:
         else:
             masker = shap.maskers.Independent(background, max_samples=n_bg)
             phi = shap.PermutationExplainer(
-                get_predict_fn(model), masker, seed=seed,
+                get_predict_fn(model, task), masker, seed=seed,
             )(X_val, max_evals=max_evals, silent=True).values
 
-        # Один выход (логиты бинарной задачи): (m, p) -> (m, p, 1).
+        # Один выход (логиты бинарной задачи, регрессия): (m, p) -> (m, p, 1).
         if phi.ndim == 2:
             phi = phi[:, :, None]
         return np.abs(phi).mean(axis=0).sum(axis=1)
@@ -380,7 +394,8 @@ class ImportanceEvaluator:
     # -----------------------------------------------------------------------
 
     def compute_mi(self, label, n_runs=None, n_neighbors=3, **kwargs):
-        """Mutual information признака с классом (mutual_info_classif).
+        """Mutual information признака с y (mutual_info_classif /
+        mutual_info_regression).
 
         Оценка по ближайшим соседям, discrete_features=False; каждый
         признак оценивается отдельно. Считается на train-части фолдов.
@@ -392,25 +407,28 @@ class ImportanceEvaluator:
         n_runs : int | None, default None
             None -> self.n_runs.
         n_neighbors : int, default 3
-            Число соседей k; должно быть меньше размера самого малого
-            класса в каждом train-фолде.
+            Число соседей k; для классификации должно быть меньше размера
+            самого малого класса в каждом train-фолде.
         **kwargs
-            Остальные параметры mutual_info_classif (например, copy);
+            Остальные параметры функции sklearn (например, copy);
             не должны дублировать явные аргументы и random_state.
 
         Возвращает
         -------
         self
         """
-        self._stable_cv(self._mi_fold, label, n_runs=n_runs,
+        self._stable_cv(self._mi_fold, label, n_runs=n_runs, task=self.task,
                         n_neighbors=n_neighbors, **kwargs)
         return self
 
     def compute_anova_f(self, label, n_runs=None):
-        """F-статистика однофакторного ANOVA (f_classif).
+        """F-статистика признака: однофакторный ANOVA (f_classif) или
+        F-тест линейной связи с y (f_regression).
 
-        Межклассовый разброс признака относительно внутриклассового;
-        p-value отбрасывается. Считается на train-части фолдов.
+        Классификация — межклассовый разброс признака относительно
+        внутриклассового; регрессия — монотонная функция квадрата
+        корреляции Пирсона признака с y. p-value отбрасывается.
+        Считается на train-части фолдов.
 
         Параметры
         ----------
@@ -423,7 +441,8 @@ class ImportanceEvaluator:
         -------
         self
         """
-        self._stable_cv(self._anova_f_fold, label, n_runs=n_runs)
+        self._stable_cv(self._anova_f_fold, label, n_runs=n_runs,
+                        task=self.task)
         return self
 
     # -----------------------------------------------------------------------
@@ -439,7 +458,8 @@ class ImportanceEvaluator:
         ----------
         model_factory : callable
             seed -> модель с feature_importances_ (make_rf, make_et,
-            make_xgb, make_lgbm), например lambda s: make_rf(s, n_estimators=100).
+            make_xgb, make_lgbm и их *_reg), например
+            lambda s: make_rf(s, n_estimators=100).
         label : str
             Уникальный label результата.
         n_runs : int | None, default None
@@ -462,7 +482,9 @@ class ImportanceEvaluator:
 
     def compute_l1_importance(self, model_factory, label, agg="sum",
                               n_runs=None):
-        """Важность по модулям коэффициентов L1-логистической регрессии.
+        """Важность по модулям коэффициентов L1-регуляризованной линейной
+        модели (логистической для классификации, ElasticNet/Lasso для
+        регрессии).
 
         Модель обучается на train-части фолда, val-часть не используется.
         Признаки стандартизованы скейлером пайплайна, поэтому модули
@@ -471,14 +493,16 @@ class ImportanceEvaluator:
         Параметры
         ----------
         model_factory : callable
-            Фабрика на основе make_logreg с l1_ratio > 0, например
-            lambda s: make_logreg(s, C=0.1, l1_ratio=1). C фиксирован
-            для всех фолдов. 
+            Фабрика с l1_ratio > 0: make_logreg, например
+            lambda s: make_logreg(s, C=0.1, l1_ratio=1), или make_linreg,
+            например lambda s: make_linreg(s, alpha=0.1, l1_ratio=1).
+            Сила регуляризации фиксирована для всех фолдов.
             Elastic-net (0 < l1_ratio < 1) допускается.
         label : str
             Уникальный label результата.
         agg : {'sum', 'max'}, default 'sum'
             Агрегация по классам: sum_k |beta_kj| или max_k |beta_kj|.
+            Для регрессии (один вектор коэффициентов) не влияет.
         n_runs : int | None, default None
             None -> self.n_runs.
 
@@ -490,11 +514,12 @@ class ImportanceEvaluator:
             raise ConfigurationError(
                 f"agg должен быть 'sum' или 'max', получено {agg!r}"
             )
-        # model_factory(0) — только для проверки параметров.
-        if self._get_estimator(model_factory(0)).l1_ratio == 0:
+        # model_factory(0) — только для проверки параметров. У Ridge
+        # (make_linreg с l1_ratio=0) атрибута l1_ratio нет.
+        if getattr(self._get_estimator(model_factory(0)), "l1_ratio", 0) == 0:
             raise ConfigurationError(
-                "L1: в модели l1_ratio=0, коэффициенты не обнуляются."
-                "Требуется задать l1_ratio > 0 в make_logreg."
+                "L1: в модели l1_ratio=0, коэффициенты не обнуляются. "
+                "Требуется задать l1_ratio > 0 в make_logreg / make_linreg."
             )
         self._stable_cv(self._l1_fold, label, model_factory=model_factory,
                         n_runs=n_runs, agg=agg)
@@ -504,7 +529,7 @@ class ImportanceEvaluator:
     # Wrapper/Post-hoc methods
     # -----------------------------------------------------------------------
 
-    def compute_pi(self, model_factory, label, scoring=("roc_auc_ovr",),
+    def compute_pi(self, model_factory, label, scoring=None,
                    n_perm_reps=30, n_runs=None, check_val_classes=True,
                    **kwargs):
         """Permutation importance (permutation_importance) на val-части фолда.
@@ -519,10 +544,14 @@ class ImportanceEvaluator:
             seed -> модель.
         label : str
             Префикс под-лейблов.
-        scoring : str | list[str], default ('roc_auc_ovr',)
+        scoring : str | list[str] | None, default None
             Строки sklearn-scorer'ов; строка заворачивается в список.
+            None -> get_default_scoring(task, 'pi'): 'roc_auc_ovr' для
+            классификации, 'r2' для регрессии.
             Для многоклассового случая: roc_auc_ovr, balanced_accuracy,
-            f1_macro, neg_log_loss (f1 и roc_auc падают).
+            f1_macro, neg_log_loss (f1 и roc_auc падают). Для регрессии:
+            r2, neg_root_mean_squared_error, neg_mean_absolute_error
+            (r2 и MSE дают одинаковое ранжирование).
         n_perm_reps : int, default 30
             Число перестановок каждого признака.
         n_runs : int | None, default None
@@ -531,6 +560,7 @@ class ImportanceEvaluator:
             Требовать все классы в каждом val-фолде (нужно для roc_auc_ovr
             и neg_log_loss). При LOGO, где val — одна группа (скважина),
             можно отключить и считать по balanced_accuracy / f1_macro.
+            Для регрессии игнорируется.
         **kwargs
             Остальные параметры permutation_importance (например,
             max_samples); не должны дублировать явные аргументы, n_jobs
@@ -540,6 +570,8 @@ class ImportanceEvaluator:
         -------
         self
         """
+        if scoring is None:
+            scoring = get_default_scoring(self.task, "pi")
         # Строка -> список: со строкой sklearn вернёт Bunch, а не dict.
         scoring = [scoring] if isinstance(scoring, str) else list(scoring)
         for metric in scoring:
@@ -555,7 +587,7 @@ class ImportanceEvaluator:
         return self
 
     def compute_shap(self, model_factory, label, explainer="auto",
-                     model_output="probability", n_background=100,
+                     model_output=None, n_background=100,
                      max_evals=500, n_runs=None):
         """SHAP-важность (интервенционный режим) на val-части фолда.
 
@@ -563,7 +595,7 @@ class ImportanceEvaluator:
         подвыборка train-части. Важность признака j — sum_k mean_i
         |phi_ijk|.
 
-        Объяснители:
+        Объяснители (классификация):
             'tree'        — TreeExplainer, точно; RF/ET при 'probability',
                             XGB/LGBM при 'raw' (вероятности бустингов
                             shap 0.54 объясняет неверно);
@@ -571,8 +603,12 @@ class ImportanceEvaluator:
                             любая модель, только model_output='probability';
             'linear'      — LinearExplainer, точно; только LogReg и
                             model_output='raw';
-            'auto'        — 'tree', если подходит, иначе 'linear' при 'raw'
-                            и 'permutation' при 'probability'.
+            'auto'        — 'tree', если подходит, иначе 'linear' для
+                            LogReg при 'raw' и 'permutation' при
+                            'probability'.
+        Регрессия: model_output только 'raw' (предсказание predict);
+            'tree' — любые RF/ET/XGB/LGBM, 'linear' — Ridge/ElasticNet
+            (make_linreg), 'permutation' — по predict, любая модель.
 
         Параметры
         ----------
@@ -581,9 +617,12 @@ class ImportanceEvaluator:
         label : str
             Уникальный label результата.
         explainer : {'auto', 'tree', 'permutation', 'linear'}, default 'auto'
-        model_output : {'probability', 'raw'}, default 'probability'
+        model_output : {'probability', 'raw'} | None, default None
+            None -> get_predict_output(task): 'probability' для
+            классификации, 'raw' для регрессии.
             'probability' — вероятности, одна шкала для всех моделей;
-            'raw' — логиты (только XGB, LGBM, LogReg).
+            'raw' — логиты классификатора (только XGB, LGBM, LogReg) или
+            предсказание регрессора.
         n_background : int, default 100
             Размер фона (берётся не больше размера train-части).
         max_evals : int, default 500
@@ -601,10 +640,21 @@ class ImportanceEvaluator:
                 "explainer должен быть 'auto', 'tree', 'permutation' или "
                 f"'linear', получено {explainer!r}"
             )
+        # Выход get_predict_fn: 'probability' (классификация) или 'raw'
+        # (регрессия). Его объясняют PermutationExplainer и TreeExplainer
+        # деревьев sklearn.
+        predict_output = get_predict_output(self.task)
+        if model_output is None:
+            model_output = predict_output
         if model_output not in ("probability", "raw"):
             raise ConfigurationError(
                 "model_output должен быть 'probability' или 'raw', "
                 f"получено {model_output!r}"
+            )
+        if model_output == "probability" and predict_output != "probability":
+            raise ConfigurationError(
+                "SHAP: model_output='probability' — только для "
+                "классификации; у регрессии выход 'raw' (predict)"
             )
 
         # model_factory(0) — только для выбора и проверки объяснителя.
@@ -617,21 +667,27 @@ class ImportanceEvaluator:
         # RF/ET — деревья sklearn, XGB/LGBM — бустинги из своих библиотек.
         is_sklearn_tree = (is_tree and
                            type(estimator).__module__.startswith("sklearn"))
+        is_linear = isinstance(estimator, (LogisticRegression, Ridge,
+                                           ElasticNet))
         name = type(estimator).__name__
 
-        # У деревьев sklearn выход — уже вероятности, логитов нет.
-        if model_output == "raw" and is_sklearn_tree:
+        # У деревьев sklearn выход — то же, что predict_fn (вероятности
+        # классификатора), логитов нет.
+        if is_sklearn_tree and model_output != predict_output:
             raise ConfigurationError(
                 f"SHAP: model_output='raw' не подходит для {name}: "
                 "логиты есть только у XGB, LGBM и LogReg"
             )
         if explainer == "auto":
-            if is_tree and (model_output == "probability") == is_sklearn_tree:
+            tree_output = predict_output if is_sklearn_tree else "raw"
+            if is_tree and model_output == tree_output:
                 explainer = "tree"
-            elif model_output == "raw":
+            elif is_linear and model_output == "raw":
                 explainer = "linear"
-            else:
+            elif model_output == predict_output:
                 explainer = "permutation"
+            else:
+                explainer = "linear"   # не подходит — ошибка ниже
 
         if explainer == "tree" and not is_tree:
             raise ConfigurationError(
@@ -647,15 +703,15 @@ class ImportanceEvaluator:
                 f"SHAP: TreeExplainer неверно объясняет вероятности {name}. "
                 "Используй explainer='permutation' или model_output='raw'"
             )
-        if explainer == "linear" and not (
-                model_output == "raw"
-                and isinstance(estimator, LogisticRegression)):
+        if explainer == "linear" and not (model_output == "raw"
+                                          and is_linear):
             raise ConfigurationError(
-                f"SHAP: explainer='linear' — только для LogReg и "
-                f"model_output='raw' (получено {name}, {model_output!r})"
+                f"SHAP: explainer='linear' — только для LogReg / Ridge / "
+                f"ElasticNet и model_output='raw' (получено {name}, "
+                f"{model_output!r})"
             )
         if explainer == "permutation":
-            if model_output == "raw":
+            if model_output != predict_output:
                 raise ConfigurationError(
                     "SHAP: explainer='permutation' объясняет вероятности; "
                     "для model_output='raw' нужен 'tree' (XGB, LGBM) "
@@ -671,7 +727,7 @@ class ImportanceEvaluator:
         self._stable_cv(self._shap_fold, label, model_factory=model_factory,
                         n_runs=n_runs, explainer=explainer,
                         model_output=model_output, n_background=n_background,
-                        max_evals=max_evals)
+                        max_evals=max_evals, task=self.task)
         return self
 
     # -----------------------------------------------------------------------

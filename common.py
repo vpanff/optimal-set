@@ -3,10 +3,16 @@ common.py — общие утилиты проекта otbor (отбор при�
 
 Содержит:
     1. Исключения проекта (DataValidationError, ConfigurationError)
-    2. Фабрики моделей (make_rf, make_xgb, make_lgbm, make_et,
-       make_knn, make_logreg, make_svc, make_mlp)
+       и проверку типа задачи (check_task)
+    2. Фабрики моделей:
+       классификация — make_rf, make_xgb, make_lgbm, make_et,
+       make_knn, make_logreg, make_svc, make_mlp;
+       регрессия — make_rf_reg, make_xgb_reg, make_lgbm_reg, make_et_reg,
+       make_knn_reg, make_linreg, make_svr, make_mlp_reg
     3. Утилиты кросс-валидации (check_cv, cv_for_run, make_folds)
-    4. Хелперы методов важности (get_filter_func, get_predict_fn)
+    4. Хелперы методов важности и метрик (get_filter_func,
+       check_mi_neighbors, get_predict_fn, get_predict_output,
+       get_default_scoring)
     5. Загрузчик данных (load_data) и проверка массивов (check_data)
 
 Принципы:
@@ -18,13 +24,23 @@ common.py — общие утилиты проекта otbor (отбор при�
       с понятными сообщениями, а не глубоко внутри fit().
     * xgboost и lightgbm импортируются внутри фабрик,
       чтобы common.py работал даже если они не установлены.
-
+    * Тип задачи (task='classification' | 'regression') влияет только на
+      хелперы разделов 3–5 этого модуля: ветки по задаче — здесь, а не
+      в методах классов. Фабрики по task не ветвятся: для регрессии —
+      отдельные make_*_reg.
+# 
 Пример использования:
     X, y, feature_names, groups, classes = load_data(
         "data.csv", target_col="Y", group_col="well_id",
         cols_to_drop=["id", "date"],
     )
     model = make_rf(seed=42, n_estimators=300)
+
+    # регрессия: classes=None, y — float
+    X, y, feature_names, groups, _ = load_data(
+        "data.csv", target_col="porosity", task="regression",
+    )
+    model = make_rf_reg(seed=42)
 """
 
 from __future__ import annotations
@@ -37,15 +53,25 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
-from sklearn.feature_selection import f_classif, mutual_info_classif
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    ExtraTreesRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.feature_selection import (
+    f_classif,
+    f_regression,
+    mutual_info_classif,
+    mutual_info_regression,
+)
+from sklearn.linear_model import ElasticNet, LogisticRegression, Ridge
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
+from sklearn.svm import SVC, SVR
 
 # ---------------------------------------------------------------------------
 # Логгер проекта
@@ -72,6 +98,39 @@ class DataValidationError(ValueError):
 class ConfigurationError(ValueError):
     """Некорректный параметр конфигурации (неизвестный тип CV,
     несовместимые опции и т.п.)."""
+
+
+# ---------------------------------------------------------------------------
+# Тип задачи
+# ---------------------------------------------------------------------------
+TASKS = ("classification", "regression")
+
+
+def check_task(task):
+    """Проверка типа задачи. Вызывается в load_data и конструкторах классов.
+
+    Нужна, потому что хелперы ветвятся как «regression или иначе»:
+    опечатка ('regresion') без проверки молча дала бы классификацию.
+
+    Параметры
+    ----------
+    task : str
+        'classification' или 'regression'.
+
+    Возвращает
+    -------
+    task : str
+
+    Исключения
+    ----------
+    ConfigurationError
+        Неизвестный тип задачи.
+    """
+    if task not in TASKS:
+        raise ConfigurationError(
+            f"task должен быть одним из {TASKS}, получено {task!r}"
+        )
+    return task
 
 # ===========================================================================
 # 1. Фабрики моделей
@@ -508,6 +567,378 @@ def make_mlp(seed, hidden_layer_sizes=(64, 32), alpha=0.01,
     ])
 
 
+# ---------------------------------------------------------------------------
+# Фабрики регрессии
+# ---------------------------------------------------------------------------
+# Те же соглашения, что у фабрик классификации (seed, Pipeline со шагами
+# 'scaler' и 'model', **kwargs). Отличия — только в отсутствии
+# class_weight и калибровки вероятностей.
+
+
+def make_rf_reg(seed, n_estimators=500, max_depth=None, **kwargs):
+    """Random Forest Regressor.
+
+    В отличие от классификатора, по умолчанию в sklearn
+    max_features=1.0: в каждом узле перебираются все признаки, деревья
+    отличаются только бутстрэпом. Это влияет на MDI: сильный признак
+    чаще забирает сплиты у коррелированных с ним. Для случайного
+    подмножества признаков в узле — max_features='sqrt' или доля (0.33)
+    через kwargs.
+
+    Параметры
+    ----------
+    seed : int
+        random_state модели (бутстрэп и выбор признаков в узлах).
+    n_estimators : int, default 500
+        Число деревьев.
+    max_depth : int | None, default None
+        Максимальная глубина дерева; None — без ограничения.
+    **kwargs
+        Остальные параметры RandomForestRegressor (например,
+        min_samples_leaf, max_features); не должны дублировать явные
+        аргументы.
+
+    Возвращает
+    -------
+    model : RandomForestRegressor
+        Необученная модель.
+    """
+    return RandomForestRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=seed,
+        **kwargs,
+    )
+
+
+def make_et_reg(seed, n_estimators=500, max_depth=None, **kwargs):
+    """Extra Trees Regressor.
+
+    Как и у make_rf_reg, по умолчанию max_features=1.0; случайность —
+    в порогах сплитов.
+
+    Параметры
+    ----------
+    seed : int
+        random_state модели (случайные пороги сплитов).
+    n_estimators : int, default 500
+        Число деревьев.
+    max_depth : int | None, default None
+        Максимальная глубина дерева; None — без ограничения.
+    **kwargs
+        Остальные параметры ExtraTreesRegressor; не должны дублировать
+        явные аргументы.
+
+    Возвращает
+    -------
+    model : ExtraTreesRegressor
+        Необученная модель.
+    """
+    return ExtraTreesRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=seed,
+        **kwargs,
+    )
+
+
+def make_xgb_reg(seed, n_estimators=300, max_depth=6, learning_rate=0.1,
+                 subsample=0.8, colsample_bytree=0.8, importance_type='gain',
+                 **kwargs):
+    """XGBoost Regressor (по умолчанию objective='reg:squarederror').
+
+    Параметры
+    ----------
+    seed : int
+        random_state модели.
+    n_estimators : int, default 300
+        Число деревьев.
+    max_depth : int, default 6
+        Максимальная глубина дерева. На малых выборках (сотни объектов)
+        стоит уменьшать (3–4): иначе деревья подгоняются под шум.
+    learning_rate : float, default 0.1
+        Шаг обучения.
+    subsample : float, default 0.8
+        Доля объектов для обучения каждого дерева.
+    colsample_bytree : float, default 0.8
+        Доля признаков для каждого дерева.
+    importance_type : str, default 'gain'
+        Тип встроенной важности (feature_importances_), как у make_xgb.
+    **kwargs
+        Остальные параметры XGBRegressor; не должны дублировать явные
+        аргументы.
+
+    Возвращает
+    -------
+    model : XGBRegressor
+        Необученная модель.
+
+    Исключения
+    ----------
+    ImportError
+        xgboost не установлен.
+    """
+    try:
+        from xgboost import XGBRegressor
+    except ImportError as e:
+        raise ImportError(
+            "xgboost не установлен: pip install xgboost"
+        ) from e
+    return XGBRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        random_state=seed,
+        importance_type=importance_type,
+        **kwargs,
+    )
+
+
+def make_lgbm_reg(seed, n_estimators=300, max_depth=6, learning_rate=0.1,
+                  subsample=0.8, colsample_bytree=0.8, subsample_freq=1,
+                  verbose=-1, importance_type="gain", **kwargs):
+    """LightGBM Regressor.
+
+    subsample_freq=1, verbose=-1, importance_type='gain' — по тем же
+    причинам, что в make_lgbm.
+
+    На малых выборках важен min_child_samples (по умолчанию 20 в
+    LightGBM): при ~200 объектах в train это ограничивает глубину сильнее,
+    чем max_depth. Задаётся через kwargs.
+
+    Параметры
+    ----------
+    seed : int
+        random_state модели.
+    n_estimators : int, default 300
+        Число деревьев.
+    max_depth : int, default 6
+        Максимальная глубина дерева.
+    learning_rate : float, default 0.1
+        Шаг обучения.
+    subsample : float, default 0.8
+        Доля объектов для каждого дерева (действует при subsample_freq > 0).
+    colsample_bytree : float, default 0.8
+        Доля признаков для каждого дерева.
+    subsample_freq : int, default 1
+        Как часто (в итерациях) выполнять бэггинг; 0 — бэггинг выключен.
+    verbose : int, default -1
+        Уровень логирования LightGBM; -1 — без вывода.
+    importance_type : str, default 'gain'
+        Тип встроенной важности (feature_importances_).
+    **kwargs
+        Остальные параметры LGBMRegressor; не должны дублировать явные
+        аргументы.
+
+    Возвращает
+    -------
+    model : LGBMRegressor
+        Необученная модель.
+
+    Исключения
+    ----------
+    ImportError
+        lightgbm не установлен.
+    """
+    try:
+        from lightgbm import LGBMRegressor
+    except ImportError as e:
+        raise ImportError(
+            "lightgbm не установлен: pip install lightgbm"
+        ) from e
+    return LGBMRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        subsample_freq=subsample_freq,
+        verbose=verbose,
+        random_state=seed,
+        importance_type=importance_type,
+        **kwargs,
+    )
+
+
+def make_knn_reg(seed=None, n_neighbors=5, weights="distance",
+                 metric="euclidean", **kwargs):
+    """KNN Regressor, обёрнутый в Pipeline со StandardScaler.
+
+    Параметры
+    ----------
+    seed : int | None, default None
+        Не используется (KNN детерминирован); оставлен для единообразия
+        интерфейса model_factory(seed).
+    n_neighbors : int, default 5
+        Число соседей.
+    weights : str, default 'distance'
+        'uniform' или 'distance'.
+    metric : str, default 'euclidean'
+        Метрика расстояния.
+    **kwargs
+        Остальные параметры KNeighborsRegressor; не должны дублировать
+        явные аргументы.
+
+    Возвращает
+    -------
+    model : Pipeline
+        Необученный Pipeline из шагов 'scaler' (StandardScaler) и
+        'model' (KNeighborsRegressor).
+    """
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", KNeighborsRegressor(
+            n_neighbors=n_neighbors,
+            weights=weights,
+            metric=metric,
+            **kwargs,
+        )),
+    ])
+
+
+def make_linreg(seed, alpha=1.0, l1_ratio=0.0, max_iter=10000, **kwargs):
+    """Регуляризованная линейная регрессия в Pipeline со StandardScaler.
+    Аналог make_logreg для регрессии.
+
+    Тип регуляризации задаётся через l1_ratio:
+        l1_ratio = 0.0        -> L2 (Ridge, точное решение)
+        l1_ratio = 1.0        -> L1 (ElasticNet с l1_ratio=1, т.е. Lasso)
+        0.0 < l1_ratio < 1.0  -> elastic-net (ElasticNet)
+    Ridge при l1_ratio=0, а не ElasticNet: координатный спуск ElasticNet
+    при чистом L2 сходится плохо (sklearn об этом предупреждает).
+
+    ВНИМАНИЕ: масштаб alpha у Ridge и ElasticNet разный. ElasticNet
+    минимизирует 1/(2n)·||y - Xw||² + alpha·(...), Ridge — ||y - Xw||² +
+    alpha·||w||², т.е. без деления на n. Одно и то же alpha при l1_ratio=0
+    и l1_ratio>0 даёт несопоставимую силу регуляризации.
+
+    Параметры
+    ----------
+    seed : int
+        random_state модели (используется ElasticNet при
+        selection='random' и Ridge с солверами sag/saga).
+    alpha : float, default 1.0
+        Сила регуляризации (больше — сильнее; обратна C в make_logreg).
+    l1_ratio : float, default 0.0
+        Доля L1 в регуляризации, от 0.0 (чистый L2) до 1.0 (чистый L1).
+    max_iter : int, default 10000
+        Максимум итераций координатного спуска (ElasticNet).
+    **kwargs
+        Остальные параметры Ridge / ElasticNet; не должны дублировать
+        явные аргументы.
+
+    Возвращает
+    -------
+    model : Pipeline
+        Необученный Pipeline из шагов 'scaler' (StandardScaler) и
+        'model' (Ridge или ElasticNet). coef_ модели — одномерный (p,).
+    """
+    if l1_ratio == 0.0:
+        model = Ridge(alpha=alpha, random_state=seed, **kwargs)
+    else:
+        model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio,
+                           max_iter=max_iter, random_state=seed, **kwargs)
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", model),
+    ])
+
+
+def make_svr(seed=None, C=1.0, epsilon=0.1, kernel="rbf", gamma="scale",
+             **kwargs):
+    """SVR, обёрнутый в Pipeline со StandardScaler.
+
+    Калибровка, как в make_svc, не нужна: регрессия не требует
+    вероятностей.
+
+    epsilon задаётся в единицах y: при большом масштабе целевой
+    переменной дефолт 0.1 почти ничего не значит, при малом — может
+    занять весь диапазон. y не масштабируется, поэтому epsilon и C
+    стоит подбирать под данные.
+
+    Параметры
+    ----------
+    seed : int | None, default None
+        Не используется (SVR детерминирован); оставлен для единообразия
+        интерфейса model_factory(seed).
+    C : float, default 1.0
+        Параметр регуляризации.
+    epsilon : float, default 0.1
+        Ширина трубки, внутри которой ошибка не штрафуется (в единицах y).
+    kernel : str, default 'rbf'
+        Тип ядра.
+    gamma : str | float, default 'scale'
+        Коэффициент ядра.
+    **kwargs
+        Остальные параметры SVR; не должны дублировать явные аргументы.
+
+    Возвращает
+    -------
+    model : Pipeline
+        Необученный Pipeline из шагов 'scaler' (StandardScaler) и
+        'model' (SVR).
+    """
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", SVR(
+            C=C,
+            epsilon=epsilon,
+            kernel=kernel,
+            gamma=gamma,
+            **kwargs,
+        )),
+    ])
+
+
+def make_mlp_reg(seed, hidden_layer_sizes=(64, 32), alpha=0.01,
+                 max_iter=2000, **kwargs):
+    """MLP Regressor, обёрнутый в Pipeline со StandardScaler.
+
+    early_stopping=True по умолчанию (через kwargs), как в make_mlp:
+    10% train-части уходит на внутреннюю валидацию. При сотнях объектов
+    это 20–30 точек — остановка становится шумной; тогда
+    early_stopping=False и меньший max_iter.
+
+    y не масштабируется: при большом масштабе целевой переменной MLP
+    обучается плохо. Если это мешает — масштабировать y до load_data или
+    обернуть модель в TransformedTargetRegressor.
+
+    Параметры
+    ----------
+    seed : int
+        random_state модели: инициализация весов, перемешивание и разбиение
+        для early stopping.
+    hidden_layer_sizes : tuple, default (64, 32)
+        Число нейронов в каждом скрытом слое.
+    alpha : float, default 0.01
+        Сила L2-регуляризации.
+    max_iter : int, default 2000
+        Максимум итераций обучения.
+    **kwargs
+        Остальные параметры MLPRegressor; не должны дублировать явные
+        аргументы.
+
+    Возвращает
+    -------
+    model : Pipeline
+        Необученный Pipeline из шагов 'scaler' (StandardScaler) и
+        'model' (MLPRegressor).
+    """
+    kwargs.setdefault("early_stopping", True)
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", MLPRegressor(
+            hidden_layer_sizes=hidden_layer_sizes,
+            alpha=alpha,
+            max_iter=max_iter,
+            random_state=seed,
+            **kwargs,
+        )),
+    ])
+
+
 # ===========================================================================
 # 2. Кросс-валидация
 # ===========================================================================
@@ -517,18 +948,22 @@ def _is_int_seed(value):
     return isinstance(value, numbers.Integral) and not isinstance(value, bool)
 
 
-def check_cv(cv, random_state=None):
+def check_cv(cv, random_state=None, task="classification"):
     """Проверка и нормализация CV-сплиттера. Вызывается в конструкторе
     каждого класса (ImportanceEvaluator, FeatureSelector, ModelValidator).
 
     Параметры
     ----------
     cv : sklearn CV splitter | None
-        None -> StratifiedKFold(n_splits=5, shuffle=True,
-        random_state=random_state).
+        None -> дефолтный сплиттер с n_splits=5, shuffle=True,
+        random_state=random_state: StratifiedKFold для классификации,
+        KFold для регрессии (стратификация по непрерывному y в sklearn
+        не поддерживается).
     random_state : int | None
         Используется только для дефолтного сплиттера (cv=None). У
         переданного сплиттера действует его собственный random_state.
+    task : {'classification', 'regression'}, default 'classification'
+        Тип задачи; влияет только на дефолтный сплиттер.
 
     Проверки (нарушение любой -> ConfigurationError):
         * у cv есть метод split;
@@ -550,11 +985,11 @@ def check_cv(cv, random_state=None):
     if cv is None:
         if random_state is None:
             raise ConfigurationError(
-                "cv=None: для дефолтного StratifiedKFold(shuffle=True) нужен "
+                "cv=None: для дефолтного сплиттера (shuffle=True) нужен "
                 "random_state, иначе фолды не воспроизводимы"
             )
-        cv = StratifiedKFold(n_splits=5, shuffle=True,
-                             random_state=random_state)
+        splitter = KFold if task == "regression" else StratifiedKFold
+        cv = splitter(n_splits=5, shuffle=True, random_state=random_state)
 
     if not hasattr(cv, "split"):
         raise ConfigurationError(
@@ -588,7 +1023,7 @@ def check_cv(cv, random_state=None):
 
 
 def make_folds(cv, X, y, groups=None, check_classes=True,
-               check_val_classes=False):
+               check_val_classes=False, task="classification"):
     """Фолды cv как список пар (train_indices, val_indices).
 
     Единая точка, через которую groups попадают в cv.split: GroupKFold и
@@ -612,6 +1047,10 @@ def make_folds(cv, X, y, groups=None, check_classes=True,
         метрику, требующую все классы (roc_auc_ovr в permutation importance).
         По умолчанию выключено: при LeaveOneGroupOut val — одна скважина,
         и в ней часто представлены не все классы.
+    task : {'classification', 'regression'}, default 'classification'
+        При регрессии классов нет: check_classes и check_val_classes
+        игнорируются (поэтому методы классов могут держать
+        check_val_classes=True по умолчанию для обеих задач).
 
     Возвращает
     -------
@@ -629,10 +1068,12 @@ def make_folds(cv, X, y, groups=None, check_classes=True,
     except ValueError as e:
         if groups is None and "groups" in str(e).lower():
             raise ConfigurationError(
-                f"{type(cv).__name__} требует groups (задай group_col "
-                "в load_data)"
+                f"{type(cv).__name__} требует groups (group_col в load_data)"
             ) from e
         raise
+
+    if task == "regression":
+        return splits
 
     parts = []
     if check_classes:
@@ -676,7 +1117,6 @@ def cv_for_run(cv, run_index):
         возвращается копия без изменений: разбиение во всех прогонах
         одинаково, прогоны отличаются только seed моделей.
     """
-    # sklearn.base.clone здесь не подходит: сплиттеры не реализуют get_params.
     cv_run = copy.deepcopy(cv)
     seed = getattr(cv, "random_state", None)
     if seed is not None:
@@ -690,26 +1130,49 @@ def cv_for_run(cv, run_index):
 
 
 # ===========================================================================
-# 3. Хелперы методов важности
+# 3. Хелперы методов важности и метрик
 # ===========================================================================
-# Единственное место, где выбирается функция sklearn для filter-методов
-# и выход модели для SHAP. При добавлении регрессии здесь появится ветка
-# по типу задачи (mutual_info_regression, f_regression, predict), а методы
-# классов не изменятся.
+# Единственное место, где по типу задачи выбираются функция sklearn для
+# filter-методов, выход модели для SHAP и дефолтная метрика. Методы классов
+# передают сюда self.task и сами по задаче не ветвятся.
 
 _FILTER_FUNCS = {
-    "mi": mutual_info_classif,
-    "anova_f": f_classif,
+    "classification": {
+        "mi": mutual_info_classif,
+        "anova_f": f_classif,
+    },
+    "regression": {
+        "mi": mutual_info_regression,
+        "anova_f": f_regression,
+    },
+}
+
+_DEFAULT_SCORING = {
+    "classification": "f1_macro",
+    "regression": "r2",
+}
+
+# Permutation importance: падение метрики при перестановке. Дискретная
+# f1_macro для этого грубая (меняется скачками), поэтому для классификации
+# — непрерывная roc_auc_ovr.
+_DEFAULT_PI_SCORING = {
+    "classification": "roc_auc_ovr",
+    "regression": "r2",
 }
 
 
-def get_filter_func(name):
-    """Функция sklearn для filter-метода по его имени.
+def get_filter_func(name, task="classification"):
+    """Функция sklearn для filter-метода по его имени и типу задачи.
 
     Параметры
     ----------
     name : str
-        'mi' -> mutual_info_classif, 'anova_f' -> f_classif.
+        'mi' -> mutual_info_classif / mutual_info_regression;
+        'anova_f' -> f_classif / f_regression. Для регрессии это F-тест
+        значимости линейной связи признака с y (эквивалент квадрата
+        корреляции Пирсона), а не ANOVA по классам; имя общее, чтобы
+        у compute_anova_f был один label для обеих задач.
+    task : {'classification', 'regression'}, default 'classification'
 
     Возвращает
     -------
@@ -721,27 +1184,84 @@ def get_filter_func(name):
     ConfigurationError
         Неизвестное имя метода.
     """
-    if name not in _FILTER_FUNCS:
+    funcs = _FILTER_FUNCS[task]
+    if name not in funcs:
         raise ConfigurationError(
             f"Неизвестный filter-метод {name!r}. "
-            f"Доступны: {list(_FILTER_FUNCS)}"
+            f"Доступны: {list(funcs)}"
         )
-    return _FILTER_FUNCS[name]
+    return funcs[name]
 
-def get_predict_fn(model):
+
+def get_predict_fn(model, task="classification"):
     """Выход модели, который объясняют модельно-независимые методы (SHAP).
 
-    Классификация -> predict_proba (вероятности классов). При добавлении
-    регрессии здесь появится ветка: predict.
+    Классификация -> predict_proba (вероятности классов);
+    регрессия -> predict.
     """
-    return model.predict_proba
+    return model.predict if task == "regression" else model.predict_proba
+
+
+def get_predict_output(task="classification"):
+    """Что возвращает get_predict_fn в терминах model_output у SHAP.
+
+    Классификация -> 'probability' (predict_proba); регрессия -> 'raw'
+    (predict — и есть «сырой» выход модели). compute_shap по этому
+    значению выбирает дефолтный model_output и проверяет объяснители,
+    не ветвясь по задаче.
+    """
+    return "raw" if task == "regression" else "probability"
+
+
+def check_mi_neighbors(y, n_neighbors, task="classification"):
+    """Проверка n_neighbors для mutual information на train-части фолда.
+
+    Классификация: sklearn при n_neighbors >= размера класса молча
+    уменьшает k для этого класса, и оценки по классам становятся
+    несопоставимыми — поэтому ошибка, а не тихая подмена.
+    Регрессия: ограничения по классам нет, проверка не нужна.
+
+    Исключения
+    ----------
+    ConfigurationError
+        n_neighbors не меньше размера самого малого класса.
+    """
+    if task == "regression":
+        return
+    counts = np.bincount(np.asarray(y))
+    n_min = int(counts[counts > 0].min())
+    if n_neighbors >= n_min:
+        raise ConfigurationError(
+            f"MI: n_neighbors={n_neighbors} должно быть меньше размера "
+            f"самого малого класса в train-фолде ({n_min})"
+        )
+
+
+def get_default_scoring(task="classification", method=None):
+    """Метрика по умолчанию (строка sklearn-scorer'а) для типа задачи.
+
+    Методы классов принимают scoring=None и подставляют её через этот
+    хелпер.
+
+    Параметры
+    ----------
+    task : {'classification', 'regression'}, default 'classification'
+    method : {None, 'pi'}, default None
+        None — метрика качества модели: 'f1_macro' / 'r2' (r2 безразмерна,
+        сравнима между датасетами);
+        'pi' — метрика permutation importance: 'roc_auc_ovr' / 'r2'.
+    """
+    if method == "pi":
+        return _DEFAULT_PI_SCORING[task]
+    return _DEFAULT_SCORING[task]
 
 
 # ===========================================================================
 # 4. Загрузка данных
 # ===========================================================================
 
-def load_data(filepath, target_col, cols_to_drop=None, group_col=None):
+def load_data(filepath, target_col, cols_to_drop=None, group_col=None,
+              task="classification"):
     """Загрузка CSV и подготовка массивов для отбора признаков.
 
     Проверки (нарушение любой -> DataValidationError):
@@ -749,11 +1269,14 @@ def load_data(filepath, target_col, cols_to_drop=None, group_col=None):
         * все признаки числовые;
         * target_col и group_col не указаны в cols_to_drop и различаются;
         * нет NaN в X, y и groups, нет inf в X;
-        * в y не меньше двух классов.
+        * классификация: в y не меньше двух классов;
+        * регрессия: y числовой, без inf.
 
-    Метки классов перекодируются в целые 0..K-1 (порядок — по возрастанию
-    исходных меток, np.unique). Соответствие «исходная метка -> код»
-    пишется в лог и возвращается массивом classes.
+    Классификация: метки перекодируются в целые 0..K-1 (порядок — по
+    возрастанию исходных меток, np.unique). Соответствие «исходная метка
+    -> код» пишется в лог и возвращается массивом classes.
+    Регрессия: y приводится к float64 без кодирования, classes=None;
+    в лог пишется сводка y (min, max, mean, std).
 
     Параметры
     ----------
@@ -767,19 +1290,23 @@ def load_data(filepath, target_col, cols_to_drop=None, group_col=None):
     group_col : str | None, default None
         Колонка с группами (well_id). Из признаков исключается,
         возвращается отдельным массивом.
+    task : {'classification', 'regression'}, default 'classification'
+        Тип задачи; определяет обработку y.
 
     Возвращает
     -------
     X : np.ndarray, shape (n_samples, n_features), dtype float64
-    y : np.ndarray, shape (n_samples,), dtype int64
-        Коды классов 0..K-1.
+    y : np.ndarray, shape (n_samples,)
+        Классификация — int64, коды классов 0..K-1;
+        регрессия — float64, исходные значения.
     feature_names : list[str]
         Имена колонок X в порядке следования.
     groups : np.ndarray, shape (n_samples,) | None
         None, если group_col не задан.
-    classes : np.ndarray, shape (K,)
-        classes[k] — исходная метка класса с кодом k.
+    classes : np.ndarray, shape (K,) | None
+        classes[k] — исходная метка класса с кодом k; None для регрессии.
     """
+    check_task(task)
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Файл не найден: {filepath}")
 
@@ -853,6 +1380,29 @@ def load_data(filepath, target_col, cols_to_drop=None, group_col=None):
     if pd.isna(y_raw).any():
         raise DataValidationError(f"NaN в целевой переменной {target_col!r}")
 
+    groups_info = f", групп={len(np.unique(groups))}" if groups is not None else ""
+
+    # --- регрессия: y как есть ---
+    if task == "regression":
+        if not pd.api.types.is_numeric_dtype(y_raw):
+            raise DataValidationError(
+                f"task='regression': целевая {target_col!r} нечисловая"
+            )
+        y = y_raw.astype(np.float64)
+        if np.isinf(y).any():
+            raise DataValidationError(
+                f"inf в целевой переменной {target_col!r}"
+            )
+        logger.info(
+            f"Целевая {target_col!r}: min={y.min():.4g}, max={y.max():.4g}, "
+            f"mean={y.mean():.4g}, std={y.std():.4g}"
+        )
+        logger.info(
+            f"Итог: n={X.shape[0]}, признаков={X.shape[1]}, "
+            f"регрессия{groups_info}"
+        )
+        return X, y, feature_names, groups, None
+
     # --- кодирование классов ---
     classes, y = np.unique(y_raw, return_inverse=True)
     y = y.astype(np.int64)
@@ -866,7 +1416,6 @@ def load_data(filepath, target_col, cols_to_drop=None, group_col=None):
     )
     logger.info(f"Кодирование классов (исходная метка -> код): {mapping}")
 
-    groups_info = f", групп={len(np.unique(groups))}" if groups is not None else ""
     logger.info(
         f"Итог: n={X.shape[0]}, признаков={X.shape[1]}, классов={len(classes)}{groups_info}"
     )

@@ -292,7 +292,7 @@ class ModelValidator:
         if n_features is None:
             if metric is None:
                 raise ConfigurationError(
-                    "get_best_subset: задай metric (для выбора N) "
+                    "get_best_subset: требуется metric (для выбора N) "
                     "или n_features"
                 )
             n_features = self.get_optimal_n_features(label, metric, rule)
